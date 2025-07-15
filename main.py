@@ -272,7 +272,7 @@ def binary_to_text(binary_str):
         return selected
     else:
         print("⚠️ No valid ASCII text segment found. Using fallback.")
-        return "Viva Palestina"
+        return " "
 
 
 def recreate_shape_from_bits(lines, text, min_space_threshold=15,space_threshold = 50):
@@ -387,8 +387,8 @@ def extract_colored_contours_with_positions(color_img, min_area=100):
     # Convert to HSV for better color segmentation
     hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
     # Mask out near-white (background)
-    lower = np.array([0, 0, 0])
-    upper = np.array([180, 255, 220])  # V < 220 to exclude white
+    lower = np.array([0, 00, 0])
+    upper = np.array([254, 254, 254])  # V < 220 to exclude white
     mask = cv2.inRange(hsv, lower, upper)
     # Morphological cleanup
     kernel = np.ones((5, 5), np.uint8)
@@ -415,15 +415,161 @@ def extract_colored_contours_with_positions(color_img, min_area=100):
     return bits
 
 
+def is_canvas_mostly_white(color_img, white_thresh=240, percent=0.9):
+    """
+    Returns True if at least `percent` of the image pixels are above `white_thresh` in all channels.
+    """
+    white_pixels = np.all(color_img > white_thresh, axis=2)
+    white_ratio = np.sum(white_pixels) / (color_img.shape[0] * color_img.shape[1])
+    print(f"🧪 White pixel ratio: {white_ratio:.2%}")
+    return white_ratio >= percent
+
+
+def extract_contours_by_section(color_img, grid_size=4, min_area=100):
+    """
+    Divide the image into sections, estimate the background color for each section, and extract contours using local background masking.
+    Returns a list of dicts: {'x', 'y', 'w', 'h', 'color'}
+    """
+    print(f"🔍 Extracting contours by section (grid {grid_size}x{grid_size})...")
+    h, w, _ = color_img.shape
+    section_h = h // grid_size
+    section_w = w // grid_size
+    bits = []
+    debug_img = color_img.copy()
+    for i in range(grid_size):
+        for j in range(grid_size):
+            y0, y1 = i * section_h, (i + 1) * section_h if i < grid_size - 1 else h
+            x0, x1 = j * section_w, (j + 1) * section_w if j < grid_size - 1 else w
+            section = color_img[y0:y1, x0:x1]
+            # Estimate background color as the mode of the section (or mean for robustness)
+            bg_color = np.median(section.reshape(-1, 3), axis=0).astype(np.uint8)
+            # Create mask for non-background (tolerant to small variations)
+            diff = np.abs(section.astype(np.int16) - bg_color.astype(np.int16))
+            mask = np.any(diff > 30, axis=2).astype(np.uint8) * 255
+            # Morphological cleanup
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            # Find contours in this section
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < min_area:
+                    continue
+                x, y, w_box, h_box = cv2.boundingRect(cnt)
+                # Offset by section position
+                x_full = x0 + x
+                y_full = y0 + y
+                # Compute average color inside the contour
+                mask_cnt = np.zeros(mask.shape, np.uint8)
+                cv2.drawContours(mask_cnt, [cnt], -1, 255, -1)
+                mean_color = cv2.mean(section, mask=mask_cnt)[:3]
+                mean_color = tuple(int(c) for c in mean_color)
+                bits.append({'x': x_full, 'y': y_full, 'w': w_box, 'h': h_box, 'color': mean_color})
+                cv2.rectangle(debug_img, (x_full, y_full), (x_full + w_box, y_full + h_box), (0, 255, 0), 2)
+    cv2.imwrite('output/debug_colored_contours_sections.png', debug_img)
+    print(f"✅ Found {len(bits)} colored regions (by section). Saved debug image: output/debug_colored_contours_sections.png")
+    return bits
+
+
+def safe_extract_colored_contours_with_positions(color_img, min_area=100, white_thresh=240, percent=0.9, grid_size=4):
+    """
+    Safely extract colored contours: if the canvas is mostly white, use the standard method; otherwise, use section-based background extraction.
+    """
+    if is_canvas_mostly_white(color_img, white_thresh=white_thresh, percent=percent):
+        print("✅ Canvas is mostly white. Using standard contour extraction.")
+        return extract_colored_contours_with_positions(color_img, min_area=min_area)
+    else:
+        print("⚠️ Canvas is NOT mostly white. Using section-based background extraction.")
+        return extract_contours_by_section(color_img, grid_size=grid_size, min_area=min_area)
+
+
+def render_text_in_blocks(blocks, text, output_file='output/translated_blocks.png'):
+    """
+    For each detected color block, fill it with a portion of the extracted text, adjusting font and size to maximize fill and readability.
+    """
+    if not blocks:
+        print("⚠️ No blocks to render.")
+        return
+    min_x = int(min(b['x'] for b in blocks))
+    min_y = int(min(b['y'] for b in blocks))
+    max_x = int(max(b['x'] + b['w'] for b in blocks))
+    max_y = int(max(b['y'] + b['h'] for b in blocks))
+    canvas_width = int(max_x - min_x + 20)
+    canvas_height = int(max_y - min_y + 20)
+    canvas = Image.new('RGB', (canvas_width, canvas_height), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font_path = "/Library/Fonts/Arial Unicode.ttf"
+        base_font = ImageFont.truetype(font_path, 12)
+    except:
+        base_font = ImageFont.load_default()
+    idx = 0
+    full_text = text * 1000
+    for block in blocks:
+        x = int(block['x'] - min_x + 10)
+        y = int(block['y'] - min_y + 10)
+        w = int(block['w'])
+        h = int(block['h'])
+        color = tuple(int(c) for c in block['color']) if isinstance(block['color'], (tuple, list)) else (0, 0, 0)
+        # Assign a substring of text for this block
+        chars_in_block = max(1, (w * h) // 600)  # heuristic: 1 char per ~600 px
+        block_text = full_text[idx:idx+chars_in_block]
+        idx += chars_in_block
+        if not block_text:
+            continue
+        # Find max font size that fits
+        font_size = 10
+        max_font_size = min(w, h)
+        for size in range(10, max_font_size):
+            try:
+                font = ImageFont.truetype(font_path, size)
+            except:
+                font = base_font
+            bbox = font.getbbox(block_text)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            if text_width > w * 0.95 or text_height > h * 0.95:
+                font_size = size - 1
+                break
+            font_size = size
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except:
+            font = base_font
+        bbox = font.getbbox(block_text)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        # Center text in block
+        text_x = int(x + (w - text_width) // 2)
+        text_y = int(y + (h - text_height) // 2)
+        rgb = (color[2], color[1], color[0]) if len(color) == 3 else (0, 0, 0)
+        draw.text((text_x, text_y), block_text, fill=rgb, font=font)
+        # Optionally, draw block border for debug
+        draw.rectangle([x, y, x + w, y + h], outline=(0, 0, 0), width=1)
+    canvas.save(output_file)
+    print(f"✅ Block text image saved as {output_file}")
+
+
 def process_image_to_shape(image_path, fallback_text="Viva Palestina"):
     thresh_img, resized_img, color_img = preprocess_image(image_path)
     scale_x = color_img.shape[1] / thresh_img.shape[1]
     scale_y = color_img.shape[0] / thresh_img.shape[0]
-    # bits = extract_bits_with_positions(thresh_img, color_img)
-    # --- To use contour-based extraction instead of OCR, comment the above and uncomment below ---
-    bits = extract_colored_contours_with_positions(color_img)
+
+    # 1. Try to extract decoded text using OCR-based bit extraction
+    ocr_bits = extract_bits_with_positions(thresh_img, color_img)
+    binary_str = ''.join(b['bit'] for b in ocr_bits)
+    decoded_text = binary_to_text(binary_str)
+
+    # 2. If decoded_text is empty or not printable, use fallback
+    if not decoded_text or not decoded_text.isprintable():
+        print("⚠️ Binary decoding failed or non-printable. Using fallback text.")
+        decoded_text = fallback_text
+
+    # 3. Extract colored regions (contours)
+    bits = safe_extract_colored_contours_with_positions(color_img)
     for b in bits:
-        b['bit'] = '1'  # or assign text as needed
+        b['bit'] = '1'  # not used for text, just for compatibility
 
     # Adjust coordinates
     for b in bits:
@@ -437,60 +583,17 @@ def process_image_to_shape(image_path, fallback_text="Viva Palestina"):
         print("❌ No bits detected.")
         return None, None
 
-    binary_str = ''.join(b.get('bit', '1') for b in bits)
-    print(f"🧮 Binary string: {binary_str[:64]}...")
-    # === [STEP 4] Render grid from bit string ===
-    # Let's assume we manually set the number of columns
-    # Infer number of columns from unique x values (quantized to some threshold)
-
-
-    bit_count = len(bits)
-
-    # Estimate cols as sqrt of bit count for roughly square grid
-    cols = int(math.sqrt(bit_count))
-    rows = math.ceil(bit_count / cols)
-
-    print(f"🧱 Adjusted Grid: {rows} rows × {cols} cols")
-
-    # Infer number of columns from unique x values (quantized to some threshold)
-    x_positions = sorted(set(b['x'] // 10 for b in bits))  # cluster by ~10px width
-    cols = len(x_positions)
-
-    # Same for rows
-    y_positions = sorted(set(b['y'] // 10 for b in bits))
-    rows = len(y_positions)
-
-    trimmed_bits, rows, cols = reconstruct_grid(binary_str, rows, cols)
-
-    print(f"🧱 Grid: {rows} rows × {cols} cols")
-
-    print_ascii_grid(trimmed_bits, rows, cols)
-
-    # Visual output (black & white)
-    draw_bits_image(
-        bits=trimmed_bits,
-        rows=rows,
-        cols=cols,
-        output_path="output/translated_grid.png",
-        block_size=200  # or try 20 for larger blocks
-    )
-
-    decoded_text = binary_to_text(binary_str)
-    if not decoded_text or not decoded_text.isprintable():
-        print("⚠️ Binary decoding failed or non-printable. Using fallback text.")
-        decoded_text = fallback_text
-
-    shape_output = recreate_shape_from_bits_grid(bits, decoded_text or fallback_text)
+    # 4. Use decoded_text to fill the regions
+    shape_output = recreate_shape_from_bits_grid(bits, decoded_text)
     lines = group_bits_by_lines(bits)
     render_text_image(lines, bits, decoded_text, output_file="output/translated_preview.png")
-
+    render_text_in_blocks(bits, decoded_text, output_file="output/translated_blocks.png")
     export_svg(bits, decoded_text, color_img)
-
 
     print("\n🔠 Decoded Text:\n", decoded_text)
     print("\n🎩 Reconstructed Shape:\n", shape_output)
     return decoded_text, shape_output
 
 if __name__ == '__main__':
-    image_path = 'test/FlagColour.1.jpeg'
+    image_path = 'test/testColor.jpeg'
     process_image_to_shape(image_path)
