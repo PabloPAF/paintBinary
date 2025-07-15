@@ -6,6 +6,9 @@ import re
 import math
 from PIL import Image, ImageDraw, ImageFont
 from pytesseract import Output
+import random
+import os
+from glob import glob
 
 # Path to Tesseract (adjust if needed)
 pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
@@ -56,27 +59,94 @@ def recreate_shape_from_bits_grid(bits, text):
     print(f"🧩 Completed grid with {rows} rows × {cols} cols")
     return output
 
+def calculate_margins(blocks, canvas_width, canvas_height):
+    left_margin = min(b['x0'] for b in blocks)
+    top_margin = min(b['y0'] for b in blocks)
+    right_margin = canvas_width - max(b['x1'] for b in blocks)
+    bottom_margin = canvas_height - max(b['y1'] for b in blocks)
+    return {
+        'left': left_margin,
+        'top': top_margin,
+        'right': right_margin,
+        'bottom': bottom_margin
+    }
 
-def render_text_image(lines, bits, decoded_text, output_file='output/translated_preview.png'):
+def get_cropped_bounds_with_margins(blocks, margin_dict, canvas_width, canvas_height):
+    """
+    Compute a cropping box that applies the margins to the content bounds.
+
+    Returns a bounding box tuple: (x0, y0, x1, y1)
+    """
+    if not blocks:
+        return (0, 0, canvas_width, canvas_height)
+
+    x0 = max(0, min(b['x0'] for b in blocks) - margin_dict['left'])
+    y0 = max(0, min(b['y0'] for b in blocks) - margin_dict['top'])
+    x1 = min(canvas_width, max(b['x1'] for b in blocks) + margin_dict['right'])
+    y1 = min(canvas_height, max(b['y1'] for b in blocks) + margin_dict['bottom'])
+
+    return (x0, y0, x1, y1)
+
+
+from PIL import Image
+
+def process_layout_with_margins(blocks, image):
+    canvas_width, canvas_height = image.size
+
+    # Step 1: Calculate margins
+    margins = calculate_margins(blocks, canvas_width, canvas_height)
+
+    # Step 2: Get crop box with applied margins
+    crop_box = get_cropped_bounds_with_margins(blocks, margins, canvas_width, canvas_height)
+
+    # Step 3: Crop the image
+    cropped_image = image.crop(crop_box)
+
+    # Step 4: Shift block coordinates relative to new origin
+    # NOTE: Use crop_box x0/y0 instead of margins for correct delta
+    dx = crop_box[0]
+    dy = crop_box[1]
+
+    adjusted_blocks = []
+    for b in blocks:
+        adjusted_block = {
+            'x0': b['x0'] - dx,
+            'y0': b['y0'] - dy,
+            'x1': b['x1'] - dx,
+            'y1': b['y1'] - dy,
+            **{k: v for k, v in b.items() if k not in ['x0', 'y0', 'x1', 'y1']}
+        }
+        adjusted_blocks.append(adjusted_block)
+
+    return cropped_image, adjusted_blocks
+
+
+def render_text_image(lines, bits, decoded_text, original_image_size, output_file='output/translated_preview.png'):
     print("🖼️ Rendering image preview...")
     if not bits:
         print("⚠️ No bits to render.")
         return
 
+    # Calculate content bounds
     min_x = min(b['x'] for b in bits)
     min_y = min(b['y'] for b in bits)
-    max_x = max(b['x'] for b in bits)
-    max_y = max(b['y'] for b in bits)
-    canvas_width = max_x - min_x + 100
-    canvas_height = max_y - min_y + 100
-    print(f"🧱 Canvas size: {canvas_width}×{canvas_height}")
+    max_x = max(b['x'] + b['w'] for b in bits)
+    max_y = max(b['y'] + b['h'] for b in bits)
+    content_width = max_x - min_x
+    content_height = max_y - min_y
+
+    # Calculate margins based on original image size
+    orig_width, orig_height = original_image_size
+    blocks = [{'x0': b['x'], 'y0': b['y'], 'x1': b['x'] + b['w'], 'y1': b['y'] + b['h']} for b in bits]
+    margins = calculate_margins(blocks, orig_width, orig_height)
+    left, top, right, bottom = margins['left'], margins['top'], margins['right'], margins['bottom']
+
+    # Set canvas size to content + margins
+    canvas_width = int(content_width + left + right)
+    canvas_height = int(content_height + top + bottom)
+    print(f"🧱 Canvas size: {canvas_width}×{canvas_height} (content: {content_width}×{content_height}, margins: L{left} T{top} R{right} B{bottom})")
 
     canvas = Image.new('RGB', (canvas_width, canvas_height), (255, 255, 255))
-
-    print("📍 Sample bits with position and color:")
-    for bit in bits[:5]:
-        print(f"  x={bit['x']}, y={bit['y']}, h={bit['h']}, color={bit['color']}")
-
     draw = ImageDraw.Draw(canvas)
 
     try:
@@ -104,14 +174,12 @@ def render_text_image(lines, bits, decoded_text, output_file='output/translated_
         if not line_text:
             continue
         # Calculate available width
-        x_positions = [bit['x'] - min_x for bit in line]
+        x_positions = [bit['x'] for bit in line]
         min_line_x = min(x_positions)
         max_line_x = max(x_positions)
         line_width = max_line_x - min_line_x if len(x_positions) > 1 else 20
-        # Estimate average char width
-        avg_char_width = line_width / max(1, len(line_text))
         # Dynamically find the best font size
-        font_size = 10
+        font_size = 12
         max_font_size = 60
         for size in range(10, max_font_size):
             try:
@@ -128,10 +196,10 @@ def render_text_image(lines, bits, decoded_text, output_file='output/translated_
             font = ImageFont.truetype(font_path, font_size)
         except:
             font = base_font
-        # Draw each character at its bit position
+        # Draw each character at its bit position, shifted by (min_x, min_y) and offset by margins
         for i, bit in enumerate(line):
-            x = bit['x'] - min_x
-            y = bit['y'] - min_y
+            x = int(bit['x'] - min_x + left)
+            y = int(bit['y'] - min_y + top)
             bgr = bit.get('color', (0, 0, 0))
             rgb = (bgr[2], bgr[1], bgr[0])
             color = rgb
@@ -142,6 +210,25 @@ def render_text_image(lines, bits, decoded_text, output_file='output/translated_
     canvas.show()  # Opens image in preview window (macOS)
     canvas.save(output_file)
     print(f"✅ Image preview saved as {output_file}")
+
+
+def apply_margins_to_blocks(blocks, margin_dict):
+    """
+    Adjust block coordinates so they are relative to the new top-left after margins are applied.
+    Typically used after cropping.
+    """
+    adjusted_blocks = []
+    for b in blocks:
+        adjusted_block = {
+            'x0': b['x0'] - margin_dict['left'],
+            'y0': b['y0'] - margin_dict['top'],
+            'x1': b['x1'] - margin_dict['left'],
+            'y1': b['y1'] - margin_dict['top'],
+            **{k: v for k, v in b.items() if k not in ['x0', 'y0', 'x1', 'y1']}  # Keep other metadata
+        }
+        adjusted_blocks.append(adjusted_block)
+
+    return adjusted_blocks
 
 
 def preprocess_image(image_path):
@@ -178,7 +265,7 @@ def extract_bits_with_positions(thresh_img, color_img):
 
     h_img, w_img = thresh_img.shape
     boxes = pytesseract.image_to_boxes(thresh_img, config=config)
-    print("📦 Raw OCR boxes:\n", boxes)
+    print("📦 Number of raw OCR boxes:\n", len(boxes))
 
     bits = []
 
@@ -318,7 +405,7 @@ def reconstruct_grid(bit_string, rows, cols):
     return padded[:total_required], rows, cols
 
 
-def draw_bits_image(bits, rows, cols, block_size=10, output_path="output/translated_preview.png"):
+def draw_bits_image(bits, rows, cols, block_size=90, output_path="output/translated_preview.png"):
     width = cols * block_size
     height = rows * block_size
     print(f"🖼️ Rendering image preview with size {width}×{height}")
@@ -484,19 +571,28 @@ def safe_extract_colored_contours_with_positions(color_img, min_area=100, white_
         return extract_contours_by_section(color_img, grid_size=grid_size, min_area=min_area)
 
 
-def render_text_in_blocks(blocks, text, output_file='output/translated_blocks.png'):
+def render_text_in_blocks(blocks, text, original_image_size, output_file='output/translated_blocks.png'):
     """
     For each detected color block, fill it with a portion of the extracted text, adjusting font and size to maximize fill and readability.
     """
     if not blocks:
         print("⚠️ No blocks to render.")
         return
+    # Calculate content bounds
     min_x = int(min(b['x'] for b in blocks))
     min_y = int(min(b['y'] for b in blocks))
     max_x = int(max(b['x'] + b['w'] for b in blocks))
     max_y = int(max(b['y'] + b['h'] for b in blocks))
-    canvas_width = int(max_x - min_x + 20)
-    canvas_height = int(max_y - min_y + 20)
+    content_width = max_x - min_x
+    content_height = max_y - min_y
+    # Calculate margins based on original image size
+    orig_width, orig_height = original_image_size
+    margin_dict = calculate_margins(
+        [{'x0': b['x'], 'y0': b['y'], 'x1': b['x'] + b['w'], 'y1': b['y'] + b['h']} for b in blocks],
+        orig_width, orig_height)
+    left, top, right, bottom = margin_dict['left'], margin_dict['top'], margin_dict['right'], margin_dict['bottom']
+    canvas_width = int(content_width + left + right)
+    canvas_height = int(content_height + top + bottom)
     canvas = Image.new('RGB', (canvas_width, canvas_height), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
     try:
@@ -507,8 +603,8 @@ def render_text_in_blocks(blocks, text, output_file='output/translated_blocks.pn
     idx = 0
     full_text = text * 1000
     for block in blocks:
-        x = int(block['x'] - min_x + 10)
-        y = int(block['y'] - min_y + 10)
+        x = int(block['x'] - min_x + left)
+        y = int(block['y'] - min_y + top)
         w = int(block['w'])
         h = int(block['h'])
         color = tuple(int(c) for c in block['color']) if isinstance(block['color'], (tuple, list)) else (0, 0, 0)
@@ -551,6 +647,223 @@ def render_text_in_blocks(blocks, text, output_file='output/translated_blocks.pn
     print(f"✅ Block text image saved as {output_file}")
 
 
+def color_distance(c1, c2):
+    return np.linalg.norm(np.array(c1) - np.array(c2))
+
+def blocks_are_close(b1, b2, proximity_thresh):
+    # Returns True if b1 and b2 are within proximity_thresh pixels of each other (bounding box distance)
+    x1, y1, w1, h1 = b1['x'], b1['y'], b1['w'], b1['h']
+    x2, y2, w2, h2 = b2['x'], b2['y'], b2['w'], b2['h']
+    # Compute the closest distance between the two rectangles
+    dx = max(x1 - (x2 + w2), x2 - (x1 + w1), 0)
+    dy = max(y1 - (y2 + h2), y2 - (y1 + h1), 0)
+    return (dx ** 2 + dy ** 2) ** 0.5 < proximity_thresh
+
+def group_blocks_to_macroblocks(blocks, color_thresh=20, proximity_thresh=200):
+    """
+    Group blocks into macroblocks by color similarity and proximity.
+    Returns a list of macroblocks, each as a dict with keys: 'blocks', 'color', 'bbox'.
+    """
+    macroblocks = []
+    used = set()
+    for i, b in enumerate(blocks):
+        if i in used:
+            continue
+        # Start a new macroblock
+        group = [i]
+        queue = [i]
+        while queue:
+            idx = queue.pop()
+            for j, other in enumerate(blocks):
+                if j in used or j in group:
+                    continue
+                if color_distance(b['color'], other['color']) < color_thresh and blocks_are_close(blocks[idx], other, proximity_thresh):
+                    group.append(j)
+                    queue.append(j)
+        for idx in group:
+            used.add(idx)
+        group_blocks = [blocks[idx] for idx in group]
+        # Macroblock color: mean color of all blocks
+        color = tuple(int(np.mean([blk['color'][k] for blk in group_blocks])) for k in range(3))
+        # Macroblock bbox: min/max of all blocks
+        min_x = min(blk['x'] for blk in group_blocks)
+        min_y = min(blk['y'] for blk in group_blocks)
+        max_x = max(blk['x'] + blk['w'] for blk in group_blocks)
+        max_y = max(blk['y'] + blk['h'] for blk in group_blocks)
+        bbox = (min_x, min_y, max_x, max_y)
+        macroblocks.append({'blocks': group_blocks, 'color': color, 'bbox': bbox})
+    return macroblocks
+
+
+def get_system_fonts():
+    # Try to get a list of system font files (ttf/otf)
+    font_paths = set()
+    for font_dir in ["/Library/Fonts", "/System/Library/Fonts", os.path.expanduser("~/Library/Fonts")]:
+        if os.path.isdir(font_dir):
+            for ext in ("ttf", "otf", "TTF", "OTF"):
+                font_paths.update(glob(os.path.join(font_dir, f"*.{ext}")))
+    return list(font_paths)
+
+
+def find_font_variants(font_path):
+    # Try to find bold/italic variants in the same directory as the font_path
+    base_dir = os.path.dirname(font_path)
+    base_name = os.path.splitext(os.path.basename(font_path))[0].lower()
+    variants = {'regular': font_path, 'bold': None, 'italic': None, 'bolditalic': None}
+    for f in os.listdir(base_dir):
+        f_lower = f.lower()
+        if base_name in f_lower:
+            if 'bold' in f_lower and 'italic' in f_lower:
+                variants['bolditalic'] = os.path.join(base_dir, f)
+            elif 'bold' in f_lower:
+                variants['bold'] = os.path.join(base_dir, f)
+            elif 'italic' in f_lower or 'oblique' in f_lower:
+                variants['italic'] = os.path.join(base_dir, f)
+    return variants
+
+
+def wrap_text_to_fit(draw, text, font, max_width):
+    # Wrap text into lines so that each line fits within max_width
+    words = text.split()
+    lines = []
+    current_line = ''
+    for word in words:
+        test_line = current_line + (' ' if current_line else '') + word
+        bbox = font.getbbox(test_line)
+        if bbox[2] - bbox[0] <= max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
+    return lines
+
+
+def wrap_text_to_fit_char(draw, text, font, max_width):
+    # Wrap text into lines so that each line fits within max_width, breaking at any character
+    lines = []
+    current_line = ''
+    for char in text:
+        test_line = current_line + char
+        bbox = font.getbbox(test_line)
+        if bbox[2] - bbox[0] <= max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = char
+    if current_line:
+        lines.append(current_line)
+    return lines
+
+
+def render_text_in_macroblocks(macroblocks, text, original_image_size, output_file='output/translated_macroblocks.png'):
+    if not macroblocks:
+        print("⚠️ No macroblocks to render.")
+        return
+    orig_width, orig_height = original_image_size
+    # Set a maximum safe size for output
+    max_dim = 4096
+    scale = 1.0
+    if orig_width > max_dim or orig_height > max_dim:
+        scale = min(max_dim / orig_width, max_dim / orig_height)
+        new_width = int(orig_width * scale)
+        new_height = int(orig_height * scale)
+        print(f"⚠️ Downscaling output canvas from {orig_width}x{orig_height} to {new_width}x{new_height}")
+    else:
+        new_width, new_height = orig_width, orig_height
+    # Sanity check for image size
+    if new_width > 10000 or new_height > 10000:
+        print(f"❌ Image size {new_width}x{new_height} is too large, skipping macroblock rendering.")
+        return
+    # Draw on a transparent layer first
+    collage_layer = Image.new('RGBA', (new_width, new_height), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(collage_layer)
+    # Debug macroblock coverage image
+    debug_img = Image.new('RGB', (new_width, new_height), (255, 255, 255))
+    debug_draw = ImageDraw.Draw(debug_img)
+    fonts = get_system_fonts()
+    if not fonts:
+        fonts = [None]  # fallback to default
+    idx = 0
+    full_text = text * 10000  # repeat more to ensure enough text
+    for macro in macroblocks:
+        min_x, min_y, max_x, max_y = macro['bbox']
+        # Crop macroblock coordinates to image bounds, then scale
+        min_x = int(max(0, min(min_x, orig_width - 1)) * scale)
+        min_y = int(max(0, min(min_y, orig_height - 1)) * scale)
+        max_x = int(max(0, min(max_x, orig_width)) * scale)
+        max_y = int(max(0, min(max_y, orig_height)) * scale)
+        w = max_x - min_x
+        h = max_y - min_y
+        # Skip macroblocks that are too small or invalid
+        if w <= 0 or h <= 0:
+            print(f"⚠️ Skipping macroblock with invalid size: ({w}x{h}) at ({min_x},{min_y})")
+            continue
+        color = macro['color']
+        # Margin: 2%
+        margin_x = int(w * 0.02)
+        margin_y = int(h * 0.02)
+        block_x0 = min_x + margin_x
+        block_y0 = min_y + margin_y
+        block_x1 = max_x - margin_x
+        block_y1 = max_y - margin_y
+        block_w = max(1, block_x1 - block_x0)
+        block_h = max(1, block_y1 - block_y0)
+        # Collage style: much higher density and overlap
+        n_chars = int((block_w * block_h) // 50)  # very dense: 1 char per ~50 px
+        if n_chars < 1:
+            n_chars = 1
+        for i in range(n_chars):
+            char = full_text[(idx + i) % len(full_text)]
+            # Prefer bold/black font if available, otherwise random
+            font_path = random.choice(fonts)
+            variants = find_font_variants(font_path) if font_path else {'regular': None}
+            if variants.get('bold'):
+                font_file = variants['bold']
+            elif variants.get('bolditalic'):
+                font_file = variants['bolditalic']
+            else:
+                font_file = variants.get('regular') or font_path
+            font_size = random.randint(int(0.5 * min(block_w, block_h)), int(4.0 * min(block_w, block_h)))
+            try:
+                font = ImageFont.truetype(font_file, font_size) if font_file else ImageFont.load_default()
+            except:
+                font = ImageFont.load_default()
+            # Random position anywhere in and around the block (heavy overlap)
+            bbox = font.getbbox(char)
+            char_w = bbox[2] - bbox[0]
+            char_h = bbox[3] - bbox[1]
+            x = random.randint(int(block_x0 - 2 * char_w), int(block_x1 + char_w))
+            y = random.randint(int(block_y0 - 2 * char_h), int(block_y1 + char_h))
+            # Random rotation between -50 and +50 degrees
+            angle = random.uniform(-50, 50)
+            # Render the character to a temporary image for rotation
+            char_img = Image.new('RGBA', (int(char_w * 2), int(char_h * 2)), (255, 255, 255, 0))
+            char_draw = ImageDraw.Draw(char_img)
+            rgb = (color[2], color[1], color[0]) if len(color) == 3 else (0, 0, 0)
+            char_draw.text((char_w // 2, char_h // 2), char, fill=rgb, font=font)
+            try:
+                rotated = char_img.rotate(angle, expand=1, resample=Image.Resampling.BICUBIC)
+            except AttributeError:
+                rotated = char_img.rotate(angle, expand=1)  # fallback, use default resample
+            # Paste onto the collage layer
+            collage_layer.paste(rotated, (x, y), rotated)
+        idx += n_chars
+        # Draw macroblock border for debug (bright red)
+        debug_draw.rectangle([min_x, min_y, max_x, max_y], outline=(255, 0, 0), width=4)
+    # Composite collage over white background
+    final_img = Image.new('RGB', (new_width, new_height), (255, 255, 255))
+    final_img.paste(collage_layer, (0, 0), collage_layer)
+    final_img.save(output_file)
+    # Save debug macroblock coverage image
+    debug_img.save('output/debug_macroblocks.png')
+    print(f"✅ Macroblock text image saved as {output_file}")
+    print(f"✅ Macroblock coverage debug image saved as output/debug_macroblocks.png")
+
+
 def process_image_to_shape(image_path, fallback_text="Viva Palestina"):
     thresh_img, resized_img, color_img = preprocess_image(image_path)
     scale_x = color_img.shape[1] / thresh_img.shape[1]
@@ -586,8 +899,11 @@ def process_image_to_shape(image_path, fallback_text="Viva Palestina"):
     # 4. Use decoded_text to fill the regions
     shape_output = recreate_shape_from_bits_grid(bits, decoded_text)
     lines = group_bits_by_lines(bits)
-    render_text_image(lines, bits, decoded_text, output_file="output/translated_preview.png")
-    render_text_in_blocks(bits, decoded_text, output_file="output/translated_blocks.png")
+    original_image_size = (color_img.shape[1], color_img.shape[0])
+    render_text_image(lines, bits, decoded_text, original_image_size, output_file="output/translated_preview.png")
+    render_text_in_blocks(bits, decoded_text, original_image_size, output_file="output/translated_blocks.png")
+    macroblocks = group_blocks_to_macroblocks(bits)
+    render_text_in_macroblocks(macroblocks, decoded_text, original_image_size, output_file="output/translated_macroblocks.png")
     export_svg(bits, decoded_text, color_img)
 
     print("\n🔠 Decoded Text:\n", decoded_text)
