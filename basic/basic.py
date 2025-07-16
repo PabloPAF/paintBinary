@@ -4,6 +4,16 @@ Basic module: Original logic for reading and rendering text inside blocks.
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from utils import get_random_font_path, extract_bits_with_positions, group_bits_by_lines, recreate_shape_from_bits, process_image_to_shape
+
+__all__ = [
+    'calculate_margins',
+    'render_text_image',
+    'process_basic',
+    'extract_bits_with_positions',
+    'group_bits_by_lines',
+    'recreate_shape_from_bits'
+]
 
 def calculate_margins(blocks, canvas_width, canvas_height):
     left_margin = min(b['x0'] for b in blocks)
@@ -17,77 +27,33 @@ def calculate_margins(blocks, canvas_width, canvas_height):
         'bottom': bottom_margin
     }
 
-def extract_bits_with_positions(thresh_img, color_img):
-    import pytesseract
-    config = r'--oem 3 --psm 11 -c user_defined_dpi=300 tessedit_char_whitelist=01'
-    h_img, w_img = thresh_img.shape
-    boxes = pytesseract.image_to_boxes(thresh_img, config=config)
-    bits = []
-    for b in boxes.splitlines():
-        try:
-            ch, x1, y1, x2, y2, _ = b.split()
-            if ch not in ['0', '1']:
-                continue
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-            y1 = h_img - y1
-            y2 = h_img - y2
-            x = min(x1, x2)
-            y = min(y1, y2)
-            w = abs(x2 - x1)
-            h = abs(y2 - y1)
-            cx = min(max(x + w // 2, 0), w_img - 1)
-            cy = min(max(y + h // 2, 0), h_img - 1)
-            color = tuple(color_img[cy, cx].tolist())
-            bits.append({
-                'bit': ch,
-                'x': x,
-                'y': y,
-                'w': w,
-                'h': h,
-                'color': color
-            })
-        except ValueError:
-            continue
-    return bits
-
-def group_bits_by_lines(bits, band_height=20):
+def render_text_image(lines, bits, decoded_text, original_image_size, output_file='output/translated_preview.png', config=None):
     if not bits:
-        return []
-    bands = {}
-    for bit in bits:
-        band_key = (bit['y'] // band_height) * band_height
-        bands.setdefault(band_key, []).append(bit)
-    sorted_band_keys = sorted(bands.keys())
-    lines = []
-    for key in sorted_band_keys:
-        line = sorted(bands[key], key=lambda b: b['x'])
-        lines.append(line)
-    return lines
-
-def render_text_image(lines, bits, decoded_text, original_image_size, output_file='output/translated_preview.png'):
-    if not bits:
+        print("[DEBUG] No bits/blocks to render")
         return
+    print(f"[DEBUG] Rendering {len(bits)} bits/blocks with text: '{decoded_text[:50]}...'")
     min_x = min(b['x'] for b in bits)
     min_y = min(b['y'] for b in bits)
     max_x = max(b['x'] + b['w'] for b in bits)
     max_y = max(b['y'] + b['h'] for b in bits)
     content_width = max_x - min_x
     content_height = max_y - min_y
+    print(f"[DEBUG] Content bounds: ({min_x},{min_y}) to ({max_x},{max_y}), size: {content_width}x{content_height}")
     orig_width, orig_height = original_image_size
     blocks = [{'x0': b['x'], 'y0': b['y'], 'x1': b['x'] + b['w'], 'y1': b['y'] + b['h']} for b in bits]
-    margins = calculate_margins(blocks, orig_width, orig_height)
-    left, top, right, bottom = margins['left'], margins['top'], margins['right'], margins['bottom']
+    left = top = right = bottom = 0
+    if config:
+        from basic.basic import calculate_margins
+        margins = calculate_margins(blocks, orig_width, orig_height)
+        left, top, right, bottom = margins['left'], margins['top'], margins['right'], margins['bottom']
     canvas_width = int(content_width + left + right)
     canvas_height = int(content_height + top + bottom)
+    print(f"[DEBUG] Canvas size: {canvas_width}x{canvas_height}")
     canvas = Image.new('RGB', (canvas_width, canvas_height), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
-    try:
-        font_path = '/Library/Fonts/Courier New.ttf'
-        base_font = ImageFont.truetype(font_path, 12)
-    except:
-        base_font = ImageFont.load_default()
     idx = 0
     full_text = decoded_text * 1000
+    chars_drawn = 0
     for line in lines:
         if not line:
             continue
@@ -105,10 +71,25 @@ def render_text_image(lines, bits, decoded_text, original_image_size, output_fil
         line_width = max_line_x - min_line_x if len(x_positions) > 1 else 20
         font_size = 12
         max_font_size = 60
-        for size in range(10, max_font_size):
+        # Font selection logic
+        if config and config.get('font_path'):
+            font_path = config['font_path']
+        else:
+            font_path = get_random_font_path()
+        if font_path:
             try:
-                font = ImageFont.truetype(font_path, size)
+                base_font = ImageFont.truetype(font_path, 12)
             except:
+                base_font = ImageFont.load_default()
+        else:
+            base_font = ImageFont.load_default()
+        for size in range(10, max_font_size):
+            if font_path:
+                try:
+                    font = ImageFont.truetype(font_path, size)
+                except:
+                    font = base_font
+            else:
                 font = base_font
             bbox = font.getbbox(line_text)
             text_width = bbox[2] - bbox[0]
@@ -116,9 +97,12 @@ def render_text_image(lines, bits, decoded_text, original_image_size, output_fil
                 font_size = size - 1
                 break
             font_size = size
-        try:
-            font = ImageFont.truetype(font_path, font_size)
-        except:
+        if font_path:
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+            except:
+                font = base_font
+        else:
             font = base_font
         for i, bit in enumerate(line):
             x = int(bit['x'] - min_x + left)
@@ -129,15 +113,123 @@ def render_text_image(lines, bits, decoded_text, original_image_size, output_fil
             char = line_text[i] if i < len(line_text) else ' '
             if 0 <= x < canvas_width and 0 <= y < canvas_height:
                 draw.text((x, y), char, fill=color, font=font)
+                chars_drawn += 1
+    print(f"[DEBUG] Drew {chars_drawn} characters")
+    canvas.save(output_file)
+    print(f"[DEBUG] Saved to {output_file}")
+
+def render_blocks_image(blocks, decoded_text, original_image_size, output_file='output/translated_blocks.png', config=None):
+    """Render text in colored blocks (for Basic mode)"""
+    if not blocks:
+        return
+    
+    # Calculate content bounds
+    min_x = min(b['x'] for b in blocks)
+    min_y = min(b['y'] for b in blocks)
+    max_x = max(b['x'] + b['w'] for b in blocks)
+    max_y = max(b['y'] + b['h'] for b in blocks)
+    content_width = max_x - min_x
+    content_height = max_y - min_y
+    
+    orig_width, orig_height = original_image_size
+    
+    # Apply margins
+    blocks_for_margins = [{'x0': b['x'], 'y0': b['y'], 'x1': b['x'] + b['w'], 'y1': b['y'] + b['h']} for b in blocks]
+    margins = calculate_margins(blocks_for_margins, orig_width, orig_height)
+    left, top, right, bottom = margins['left'], margins['top'], margins['right'], margins['bottom']
+    
+    canvas_width = int(content_width + left + right)
+    canvas_height = int(content_height + top + bottom)
+    
+    canvas = Image.new('RGB', (canvas_width, canvas_height), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    
+    # Font selection logic
+    if config and config.get('font_path'):
+        font_path = config['font_path']
+    else:
+        font_path = get_random_font_path()
+    
+    if font_path:
+        try:
+            base_font = ImageFont.truetype(font_path, 12)
+        except:
+            base_font = ImageFont.load_default()
+    else:
+        base_font = ImageFont.load_default()
+    
+    full_text = decoded_text * 1000
+    text_idx = 0
+    
+    for i, block in enumerate(blocks):
+        x = int(block['x'] - min_x + left)
+        y = int(block['y'] - min_y + top)
+        w = int(block['w'])
+        h = int(block['h'])
+        color = tuple(int(c) for c in block['color']) if isinstance(block['color'], (tuple, list)) else (0, 0, 0)
+        
+        # Get character for this block
+        if text_idx >= len(full_text):
+            text_idx = 0
+        char = full_text[text_idx]
+        text_idx += 1
+        
+        # Ensure we have a printable character
+        if not char.isprintable():
+            char = 'A'  # Fallback to a safe character
+        
+        # Find appropriate font size
+        font_size = 10
+        max_font_size = min(w, h)
+        for size in range(10, max_font_size):
+            if font_path:
+                try:
+                    font = ImageFont.truetype(font_path, size)
+                except:
+                    font = base_font
+            else:
+                font = base_font
+            bbox = font.getbbox(char)
+            char_w = bbox[2] - bbox[0]
+            char_h = bbox[3] - bbox[1]
+            if char_w <= w * 0.8 and char_h <= h * 0.8:
+                font_size = size
+            else:
+                break
+        
+        if font_path:
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+            except:
+                font = base_font
+        else:
+            font = base_font
+        
+        # Center text in block
+        bbox = font.getbbox(char)
+        char_w = bbox[2] - bbox[0]
+        char_h = bbox[3] - bbox[1]
+        text_x = int(x + (w - char_w) // 2)
+        text_y = int(y + (h - char_h) // 2)
+        
+        # Draw character with the block's color
+        rgb = (color[2], color[1], color[0]) if len(color) == 3 else (0, 0, 0)
+        text_color = rgb  # Use the block's color for text
+        if 0 <= text_x < canvas_width and 0 <= text_y < canvas_height:
+            draw.text((text_x, text_y), char, fill=text_color, font=font)
+    
     canvas.save(output_file)
 
-def process_basic(image_path, config, decoded_text):
-    color_img = cv2.imread(image_path)
-    if color_img is None:
-        print(f"[ERROR] Could not load image: {image_path}")
-        return
-    thresh_img = np.zeros_like(color_img[...,0])  # Placeholder for thresholded image
-    bits = extract_bits_with_positions(thresh_img, color_img)
-    lines = group_bits_by_lines(bits)
-    original_image_size = (color_img.shape[1], color_img.shape[0])
-    render_text_image(lines, bits, decoded_text, original_image_size, output_file="output/final_output_basic.jpeg") 
+def process_basic(image_path, config, decoded_text, features=None):
+    # Use provided features or extract if not provided
+    if features is None:
+        decoded_text, shape_output, features = process_image_to_shape(image_path, config=config)
+    bits = features.get('bits', [])
+    blocks = features.get('blocks', [])
+    lines = features.get('lines', [])
+    original_image_size = (features['color_img'].shape[1], features['color_img'].shape[0]) if features.get('color_img') is not None else (0, 0)
+    # Use blocks for basic mode (colored regions) instead of bits (binary positions)
+    if blocks:
+        render_blocks_image(blocks, decoded_text, original_image_size, output_file="output/final_output_basic.jpeg", config=config)
+    else:
+        render_text_image(lines, bits, decoded_text, original_image_size, output_file="output/final_output_basic.jpeg", config=config) 

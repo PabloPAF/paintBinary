@@ -4,6 +4,7 @@ Posterlike module: Extracts colored regions and renders text in a collage/poster
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from utils import get_random_font_path, process_image_to_shape
 
 def color_distance(c1, c2):
     return np.linalg.norm(np.array(c1) - np.array(c2))
@@ -153,17 +154,115 @@ def safe_extract_colored_contours_with_positions(color_img, min_area=100, white_
         print("⚠️ Canvas is NOT mostly white. Using section-based background extraction.")
         return extract_contours_by_section(color_img, grid_size=grid_size, min_area=min_area)
 
-def render_text_in_macroblocks_gridstyle(macroblocks, text, original_image_size, output_file):
-    # (Stub: implement as needed)
-    pass
-
-def process_posterlike(image_path, config, decoded_text):
-    color_img = cv2.imread(image_path)
-    if color_img is None:
-        print(f"[ERROR] Could not load image: {image_path}")
+def render_text_in_macroblocks_gridstyle(macroblocks, text, original_image_size, output_file, config=None):
+    if not macroblocks:
+        print("⚠️ No macroblocks to render.")
         return
-    bits = safe_extract_colored_contours_with_positions(color_img, min_area=config['min_area'])
-    macroblocks = group_blocks_to_macroblocks(bits, color_thresh=config['macroblock_color_thresh'], proximity_thresh=config['macroblock_proximity_thresh'])
-    merged_macroblocks = merge_macroblocks(macroblocks, proximity_thresh=config['macroblock_proximity_thresh'], color_thresh=config['macroblock_color_thresh'])
-    original_image_size = (color_img.shape[1], color_img.shape[0])
-    render_text_in_macroblocks_gridstyle(merged_macroblocks, decoded_text, original_image_size, output_file="output/final_output_posterlike.jpeg") 
+    orig_width, orig_height = original_image_size
+    canvas = Image.new('RGB', (orig_width, orig_height), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    idx = 0
+    full_text = text * 10000
+    min_font_pt = 11
+    max_font_pt = 250
+    min_area = 50
+    large_block_threshold = 2000
+    for i, macro in enumerate(macroblocks):
+        min_x, min_y, max_x, max_y = macro['bbox']
+        w = max_x - min_x
+        h = max_y - min_y
+        area = w * h
+        if w <= 0 or h <= 0 or area < min_area:
+            continue
+        color = macro['color']
+        text_color = (color[2], color[1], color[0]) if len(color) == 3 else (0, 0, 0)
+        # Font selection logic
+        if config and config.get('font_path'):
+            font_path = config['font_path']
+        else:
+            font_path = get_random_font_path()
+        # Decide approach based on macroblock size
+        if area >= large_block_threshold:
+            font_size = None
+            best_grid = (1, 1)
+            for size in range(max_font_pt, min_font_pt - 1, -1):
+                if font_path:
+                    try:
+                        font = ImageFont.truetype(font_path, size)
+                    except:
+                        font = ImageFont.load_default()
+                else:
+                    font = ImageFont.load_default()
+                bbox = font.getbbox('M')
+                char_w = bbox[2] - bbox[0]
+                char_h = bbox[3] - bbox[1]
+                if char_w <= w and char_h <= h:
+                    n_across = max(1, w // char_w)
+                    n_down = max(1, h // char_h)
+                    if n_across * char_w <= w * 0.98 and n_down * char_h <= h * 0.98:
+                        font_size = size
+                        best_grid = (n_across, n_down)
+                        break
+            if font_size is None:
+                continue
+            if font_path:
+                try:
+                    font = ImageFont.truetype(font_path, font_size)
+                except:
+                    font = ImageFont.load_default()
+            else:
+                font = ImageFont.load_default()
+            bbox = font.getbbox('M')
+            char_w = bbox[2] - bbox[0]
+            char_h = bbox[3] - bbox[1]
+            n_across, n_down = best_grid
+            for row in range(n_down):
+                for col in range(n_across):
+                    char = full_text[idx % len(full_text)]
+                    idx += 1
+                    x = int(min_x + col * char_w)
+                    y = int(min_y + row * char_h)
+                    if x + char_w <= max_x and y + char_h <= max_y:
+                        draw.text((x, y), char, fill=text_color, font=font)
+        else:
+            font_size = None
+            for size in range(max_font_pt, min_font_pt - 1, -1):
+                if font_path:
+                    try:
+                        font = ImageFont.truetype(font_path, size)
+                    except:
+                        font = ImageFont.load_default()
+                else:
+                    font = ImageFont.load_default()
+                bbox = font.getbbox('M')
+                char_w = bbox[2] - bbox[0]
+                char_h = bbox[3] - bbox[1]
+                if char_w <= w and char_h <= h:
+                    font_size = size
+                    break
+            if font_size is None:
+                continue
+            if font_path:
+                try:
+                    font = ImageFont.truetype(font_path, font_size)
+                except:
+                    font = ImageFont.load_default()
+            else:
+                font = ImageFont.load_default()
+            bbox = font.getbbox('M')
+            char_w = bbox[2] - bbox[0]
+            char_h = bbox[3] - bbox[1]
+            x = int(min_x + (w - char_w) // 2)
+            y = int(min_y + (h - char_h) // 2)
+            char = full_text[idx % len(full_text)]
+            idx += 1
+            draw.text((x, y), char, fill=text_color, font=font)
+    canvas.save(output_file)
+
+def process_posterlike(image_path, config, decoded_text, features=None):
+    # Use provided features or extract if not provided
+    if features is None:
+        decoded_text, shape_output, features = process_image_to_shape(image_path, config=config)
+    macroblocks = features.get('macroblocks', [])
+    original_image_size = (features['color_img'].shape[1], features['color_img'].shape[0]) if features.get('color_img') is not None else (0, 0)
+    render_text_in_macroblocks_gridstyle(macroblocks, decoded_text, original_image_size, output_file="output/final_output_posterlike.jpeg", config=config) 
