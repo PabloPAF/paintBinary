@@ -659,7 +659,7 @@ def blocks_are_close(b1, b2, proximity_thresh):
     dy = max(y1 - (y2 + h2), y2 - (y1 + h1), 0)
     return (dx ** 2 + dy ** 2) ** 0.5 < proximity_thresh
 
-def group_blocks_to_macroblocks(blocks, color_thresh=20, proximity_thresh=200):
+def group_blocks_to_macroblocks(blocks, color_thresh=10, proximity_thresh=40):
     """
     Group blocks into macroblocks by color similarity and proximity.
     Returns a list of macroblocks, each as a dict with keys: 'blocks', 'color', 'bbox'.
@@ -693,6 +693,56 @@ def group_blocks_to_macroblocks(blocks, color_thresh=20, proximity_thresh=200):
         bbox = (min_x, min_y, max_x, max_y)
         macroblocks.append({'blocks': group_blocks, 'color': color, 'bbox': bbox})
     return macroblocks
+
+
+def merge_macroblocks(macroblocks, proximity_thresh=20, color_thresh=5):
+    """
+    Merge macroblocks that are within proximity_thresh and have color distance < color_thresh.
+    Returns a new list of merged macroblocks. Logs the number of merges performed.
+    """
+    import numpy as np
+    merged = []
+    used = set()
+    merges = 0
+    for i, m1 in enumerate(macroblocks):
+        if i in used:
+            continue
+        group = [i]
+        queue = [i]
+        while queue:
+            idx = queue.pop()
+            m_a = macroblocks[idx]
+            for j, m_b in enumerate(macroblocks):
+                if j in used or j in group:
+                    continue
+                # Proximity: bounding boxes within threshold
+                a_min_x, a_min_y, a_max_x, a_max_y = m_a['bbox']
+                b_min_x, b_min_y, b_max_x, b_max_y = m_b['bbox']
+                dx = max(a_min_x - b_max_x, b_min_x - a_max_x, 0)
+                dy = max(a_min_y - b_max_y, b_min_y - a_max_y, 0)
+                if (dx ** 2 + dy ** 2) ** 0.5 > proximity_thresh:
+                    continue
+                # Color distance
+                c1 = np.array(m_a['color'])
+                c2 = np.array(m_b['color'])
+                if np.linalg.norm(c1 - c2) > color_thresh:
+                    continue
+                group.append(j)
+                queue.append(j)
+                merges += 1
+        for idx in group:
+            used.add(idx)
+        group_blocks = [macroblocks[idx] for idx in group]
+        # Merge bbox
+        min_x = min(m['bbox'][0] for m in group_blocks)
+        min_y = min(m['bbox'][1] for m in group_blocks)
+        max_x = max(m['bbox'][2] for m in group_blocks)
+        max_y = max(m['bbox'][3] for m in group_blocks)
+        # Merge color (average)
+        color = tuple(int(np.mean([m['color'][k] for m in group_blocks])) for k in range(3))
+        merged.append({'blocks': sum([m['blocks'] for m in group_blocks], []), 'color': color, 'bbox': (min_x, min_y, max_x, max_y)})
+    print(f"Macroblock merges performed: {merges}")
+    return merged
 
 
 def get_system_fonts():
@@ -764,7 +814,6 @@ def render_text_in_macroblocks(macroblocks, text, original_image_size, output_fi
         print("⚠️ No macroblocks to render.")
         return
     orig_width, orig_height = original_image_size
-    # Set a maximum safe size for output
     max_dim = 4096
     scale = 1.0
     if orig_width > max_dim or orig_height > max_dim:
@@ -774,24 +823,21 @@ def render_text_in_macroblocks(macroblocks, text, original_image_size, output_fi
         print(f"⚠️ Downscaling output canvas from {orig_width}x{orig_height} to {new_width}x{new_height}")
     else:
         new_width, new_height = orig_width, orig_height
-    # Sanity check for image size
     if new_width > 10000 or new_height > 10000:
         print(f"❌ Image size {new_width}x{new_height} is too large, skipping macroblock rendering.")
         return
-    # Draw on a transparent layer first
     collage_layer = Image.new('RGBA', (new_width, new_height), (255, 255, 255, 0))
     draw = ImageDraw.Draw(collage_layer)
-    # Debug macroblock coverage image
     debug_img = Image.new('RGB', (new_width, new_height), (255, 255, 255))
     debug_draw = ImageDraw.Draw(debug_img)
     fonts = get_system_fonts()
     if not fonts:
-        fonts = [None]  # fallback to default
+        fonts = [None]
     idx = 0
-    full_text = text * 10000  # repeat more to ensure enough text
+    full_text = text * 10000
+    min_block_size = 100
     for macro in macroblocks:
         min_x, min_y, max_x, max_y = macro['bbox']
-        # Crop macroblock coordinates to image bounds, then scale
         min_x = int(max(0, min(min_x, orig_width - 1)) * scale)
         min_y = int(max(0, min(min_y, orig_height - 1)) * scale)
         max_x = int(max(0, min(max_x, orig_width)) * scale)
@@ -803,22 +849,20 @@ def render_text_in_macroblocks(macroblocks, text, original_image_size, output_fi
             print(f"⚠️ Skipping macroblock with invalid size: ({w}x{h}) at ({min_x},{min_y})")
             continue
         color = macro['color']
-        # Margin: 2%
-        margin_x = int(w * 0.02)
-        margin_y = int(h * 0.02)
-        block_x0 = min_x + margin_x
-        block_y0 = min_y + margin_y
-        block_x1 = max_x - margin_x
-        block_y1 = max_y - margin_y
+        block_x0 = min_x
+        block_y0 = min_y
+        block_x1 = max_x
+        block_y1 = max_y
         block_w = max(1, block_x1 - block_x0)
         block_h = max(1, block_y1 - block_y0)
-        # Collage style: much higher density and overlap
-        n_chars = int((block_w * block_h) // 50)  # very dense: 1 char per ~50 px
+        min_font = int(0.8 * min(block_w, block_h))
+        max_font = int(2.5 * min(block_w, block_h))
+        step = max(1, min_font // 5)
+        n_chars = int((block_w * block_h) // (step * step)) * 5
         if n_chars < 1:
             n_chars = 1
         for i in range(n_chars):
             char = full_text[(idx + i) % len(full_text)]
-            # Prefer bold/black font if available, otherwise random
             font_path = random.choice(fonts)
             variants = find_font_variants(font_path) if font_path else {'regular': None}
             if variants.get('bold'):
@@ -827,20 +871,17 @@ def render_text_in_macroblocks(macroblocks, text, original_image_size, output_fi
                 font_file = variants['bolditalic']
             else:
                 font_file = variants.get('regular') or font_path
-            font_size = random.randint(int(0.5 * min(block_w, block_h)), int(4.0 * min(block_w, block_h)))
+            font_size = random.randint(min_font, max_font)
             try:
                 font = ImageFont.truetype(font_file, font_size) if font_file else ImageFont.load_default()
             except:
                 font = ImageFont.load_default()
-            # Random position anywhere in and around the block (heavy overlap)
+            angle = random.uniform(-50, 50)
             bbox = font.getbbox(char)
             char_w = bbox[2] - bbox[0]
             char_h = bbox[3] - bbox[1]
-            x = random.randint(int(block_x0 - 2 * char_w), int(block_x1 + char_w))
-            y = random.randint(int(block_y0 - 2 * char_h), int(block_y1 + char_h))
-            # Random rotation between -50 and +50 degrees
-            angle = random.uniform(-50, 50)
-            # Render the character to a temporary image for rotation
+            x = random.randint(int(block_x0 - char_w // 2), int(block_x1 - char_w // 2))
+            y = random.randint(int(block_y0 - char_h // 2), int(block_y1 - char_h // 2))
             char_img = Image.new('RGBA', (int(char_w * 2), int(char_h * 2)), (255, 255, 255, 0))
             char_draw = ImageDraw.Draw(char_img)
             rgb = (color[2], color[1], color[0]) if len(color) == 3 else (0, 0, 0)
@@ -848,68 +889,330 @@ def render_text_in_macroblocks(macroblocks, text, original_image_size, output_fi
             try:
                 rotated = char_img.rotate(angle, expand=1, resample=Image.Resampling.BICUBIC)
             except AttributeError:
-                rotated = char_img.rotate(angle, expand=1)  # fallback, use default resample
-            # Paste onto the collage layer
+                rotated = char_img.rotate(angle, expand=1)
             collage_layer.paste(rotated, (x, y), rotated)
         idx += n_chars
-        # Draw macroblock border for debug (bright red)
         debug_draw.rectangle([min_x, min_y, max_x, max_y], outline=(255, 0, 0), width=4)
-    # Composite collage over white background
     final_img = Image.new('RGB', (new_width, new_height), (255, 255, 255))
     final_img.paste(collage_layer, (0, 0), collage_layer)
     final_img.save(output_file)
-    # Save debug macroblock coverage image
     debug_img.save('output/debug_macroblocks.png')
     print(f"✅ Macroblock text image saved as {output_file}")
     print(f"✅ Macroblock coverage debug image saved as output/debug_macroblocks.png")
 
 
-def process_image_to_shape(image_path, fallback_text="Viva Palestina"):
+def render_macroblock_grid_preview(macroblocks, text, original_image_size, output_file='output/debug_colorBlocks.png'):
+    """
+    For each macroblock, fill its bounding box with a dense grid of text, using the macroblock's color.
+    The style is regular grid (not collage/overlap), edge-to-edge, using a monospaced font if possible.
+    This is for debugging: macroblock boundaries may be visible.
+    """
+    if not macroblocks:
+        print("⚠️ No macroblocks to render.")
+        return
+    orig_width, orig_height = original_image_size
+    canvas = Image.new('RGB', (orig_width, orig_height), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font_path = "/Library/Fonts/Courier New.ttf"
+        base_font = ImageFont.truetype(font_path, 12)
+    except:
+        base_font = ImageFont.load_default()
+        print("⚠️ Could not load monospaced font, using default.")
+    idx = 0
+    full_text = text * 10000
+    for macro in macroblocks:
+        min_x, min_y, max_x, max_y = macro['bbox']
+        w = max_x - min_x
+        h = max_y - min_y
+        if w <= 0 or h <= 0:
+            continue
+        color = macro['color']
+        rgb = (color[2], color[1], color[0]) if len(color) == 3 else (0, 0, 0)
+        font_size = 10
+        max_font_size = min(w, h)
+        chars_across = 1
+        chars_down = 1
+        for size in range(8, max_font_size):
+            try:
+                font = ImageFont.truetype(font_path, size)
+            except:
+                font = base_font
+            bbox = font.getbbox('M')
+            char_w = bbox[2] - bbox[0]
+            char_h = bbox[3] - bbox[1]
+            n_across = max(1, w // char_w)
+            n_down = max(1, h // char_h)
+            if n_across * char_w > w * 0.98 or n_down * char_h > h * 0.98:
+                font_size = size - 1
+                break
+            font_size = size
+            chars_across = n_across
+            chars_down = n_down
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except:
+            font = base_font
+        bbox = font.getbbox('M')
+        char_w = bbox[2] - bbox[0]
+        char_h = bbox[3] - bbox[1]
+        n_across = max(1, w // char_w)
+        n_down = max(1, h // char_h)
+        for row in range(n_down):
+            for col in range(n_across):
+                char = full_text[idx % len(full_text)]
+                idx += 1
+                x = int(min_x + col * char_w)
+                y = int(min_y + row * char_h)
+                if x + char_w <= max_x and y + char_h <= max_y:
+                    draw.text((x, y), char, fill=rgb, font=font)
+        # Draw macroblock boundary for debug
+        draw.rectangle([min_x, min_y, max_x, max_y], outline=(255, 0, 0), width=2)
+    canvas.save(output_file)
+    print(f"✅ Macroblock grid debug preview saved as {output_file}")
+
+
+def render_macroblock_grid_final(macroblocks, text, original_image_size, output_file):
+    """
+    For each macroblock, fill its bounding box with a dense grid of text, using black text for debugging.
+    The style is regular grid (not collage/overlap), edge-to-edge, using a monospaced font if possible.
+    This is the final output: NO macroblock outlines or debug overlays, and no colored fills.
+    """
+    if not macroblocks:
+        print("⚠️ No macroblocks to render.")
+        return
+    orig_width, orig_height = original_image_size
+    canvas = Image.new('RGB', (orig_width, orig_height), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font_path = "/Library/Fonts/Courier New.ttf"
+        base_font = ImageFont.truetype(font_path, 20)
+    except Exception as e:
+        print(f"⚠️ Could not load monospaced font: {e}. Using default.")
+        base_font = ImageFont.load_default()
+    idx = 0
+    full_text = text * 10000
+    for macro_idx, macro in enumerate(macroblocks):
+        min_x, min_y, max_x, max_y = macro['bbox']
+        w = max_x - min_x
+        h = max_y - min_y
+        if w <= 0 or h <= 0:
+            continue
+        text_color = (0, 0, 0)  # Always black for debugging
+        min_font_size = 20
+        max_font_size = min(w, h)
+        font_size = min_font_size
+        chars_across = 1
+        chars_down = 1
+        for size in range(min_font_size, max_font_size):
+            try:
+                font = ImageFont.truetype(font_path, size)
+            except:
+                font = base_font
+            bbox = font.getbbox('M')
+            char_w = bbox[2] - bbox[0]
+            char_h = bbox[3] - bbox[1]
+            n_across = max(1, w // char_w)
+            n_down = max(1, h // char_h)
+            if n_across * char_w > w * 0.98 or n_down * char_h > h * 0.98:
+                font_size = size - 1
+                break
+            font_size = size
+            chars_across = n_across
+            chars_down = n_down
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except:
+            font = base_font
+        bbox = font.getbbox('M')
+        char_w = bbox[2] - bbox[0]
+        char_h = bbox[3] - bbox[1]
+        n_across = max(1, w // char_w)
+        n_down = max(1, h // char_h)
+        print(f"Macroblock {macro_idx}: font_size={font_size}, chars_across={n_across}, chars_down={n_down}, char_w={char_w}, char_h={char_h}")
+        for row in range(n_down):
+            for col in range(n_across):
+                char = full_text[idx % len(full_text)]
+                idx += 1
+                x = int(min_x + col * char_w)
+                y = int(min_y + row * char_h)
+                if x + char_w <= max_x and y + char_h <= max_y:
+                    draw.text((x, y), char, fill=text_color, font=font)
+                    if row == 0 and col == 0:
+                        print(f"  Sample char: '{char}' at ({x},{y})")
+    canvas.save(output_file)
+    print(f"✅ Final macroblock grid output saved as {output_file}")
+
+
+
+
+def render_text_in_macroblocks_gridstyle(macroblocks, text, original_image_size, output_file):
+    """
+    Fill macroblocks with multiple characters (grid approach). For large macroblocks, render a grid of characters.
+    For small macroblocks, render one large character. Use progressive font size testing (250pt down to 11pt).
+    Use the macroblock's color for the text. No outlines or debug overlays.
+    """
+    if not macroblocks:
+        print("⚠️ No macroblocks to render.")
+        return
+    orig_width, orig_height = original_image_size
+    canvas = Image.new('RGB', (orig_width, orig_height), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font_path = "/Library/Fonts/Courier New.ttf"
+        base_font = ImageFont.truetype(font_path, 12)
+    except Exception as e:
+        print(f"⚠️ Could not load monospaced font: {e}. Using default.")
+        base_font = ImageFont.load_default()
+    idx = 0
+    full_text = text * 10000
+    min_font_pt = 11
+    max_font_pt = 250
+    min_area = 50
+    large_block_threshold = 2000  # Area threshold to decide between grid vs single char
+    skipped_area = 0
+    skipped_font = 0
+    total = len(macroblocks)
+    font_sizes_used = []
+    for i, macro in enumerate(macroblocks):
+        min_x, min_y, max_x, max_y = macro['bbox']
+        w = max_x - min_x
+        h = max_y - min_y
+        area = w * h
+        if w <= 0 or h <= 0 or area < min_area:
+            skipped_area += 1
+            continue
+        color = macro['color']
+        text_color = (color[2], color[1], color[0]) if len(color) == 3 else (0, 0, 0)
+        
+        # Decide approach based on macroblock size
+        if area >= large_block_threshold:
+            # Large macroblock: use grid approach
+            font_size = None
+            best_grid = (1, 1)
+            for size in range(max_font_pt, min_font_pt - 1, -1):
+                try:
+                    font = ImageFont.truetype(font_path, size)
+                except:
+                    font = base_font
+                bbox = font.getbbox('M')
+                char_w = bbox[2] - bbox[0]
+                char_h = bbox[3] - bbox[1]
+                if char_w <= w and char_h <= h:
+                    n_across = max(1, w // char_w)
+                    n_down = max(1, h // char_h)
+                    if n_across * char_w <= w * 0.98 and n_down * char_h <= h * 0.98:
+                        font_size = size
+                        best_grid = (n_across, n_down)
+                        break
+            if font_size is None:
+                skipped_font += 1
+                continue
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+            except:
+                font = base_font
+            bbox = font.getbbox('M')
+            char_w = bbox[2] - bbox[0]
+            char_h = bbox[3] - bbox[1]
+            n_across, n_down = best_grid
+            for row in range(n_down):
+                for col in range(n_across):
+                    char = full_text[idx % len(full_text)]
+                    idx += 1
+                    x = int(min_x + col * char_w)
+                    y = int(min_y + row * char_h)
+                    if x + char_w <= max_x and y + char_h <= max_y:
+                        draw.text((x, y), char, fill=text_color, font=font)
+            print(f"Macroblock {i} (large): font_size={font_size}, grid={n_across}x{n_down}, bbox=({min_x},{min_y},{max_x},{max_y})")
+        else:
+            # Small macroblock: use single large character
+            font_size = None
+            for size in range(max_font_pt, min_font_pt - 1, -1):
+                try:
+                    font = ImageFont.truetype(font_path, size)
+                except:
+                    font = base_font
+                bbox = font.getbbox('M')
+                char_w = bbox[2] - bbox[0]
+                char_h = bbox[3] - bbox[1]
+                if char_w <= w and char_h <= h:
+                    font_size = size
+                    break
+            if font_size is None:
+                skipped_font += 1
+                continue
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+            except:
+                font = base_font
+            bbox = font.getbbox('M')
+            char_w = bbox[2] - bbox[0]
+            char_h = bbox[3] - bbox[1]
+            x = int(min_x + (w - char_w) // 2)
+            y = int(min_y + (h - char_h) // 2)
+            char = full_text[idx % len(full_text)]
+            idx += 1
+            draw.text((x, y), char, fill=text_color, font=font)
+            print(f"Macroblock {i} (small): font_size={font_size}, char='{char}', bbox=({min_x},{min_y},{max_x},{max_y})")
+        
+        font_sizes_used.append(font_size)
+    canvas.save(output_file)
+    print(f"✅ Macroblock grid-style text output saved as {output_file}")
+    print(f"Macroblocks: total={total}, skipped_area={skipped_area}, skipped_font={skipped_font}, rendered={total-skipped_area-skipped_font}")
+    if font_sizes_used:
+        print(f"Font sizes used: min={min(font_sizes_used)}, max={max(font_sizes_used)}, avg={sum(font_sizes_used)/len(font_sizes_used):.1f}")
+        print(f"Biggest font size applied: {max(font_sizes_used)}pt")
+
+
+def process_image_to_shape(image_path, fallback_text="VivaPalestina"):
     thresh_img, resized_img, color_img = preprocess_image(image_path)
     scale_x = color_img.shape[1] / thresh_img.shape[1]
     scale_y = color_img.shape[0] / thresh_img.shape[0]
-
     # 1. Try to extract decoded text using OCR-based bit extraction
     ocr_bits = extract_bits_with_positions(thresh_img, color_img)
     binary_str = ''.join(b['bit'] for b in ocr_bits)
     decoded_text = binary_to_text(binary_str)
-
     # 2. If decoded_text is empty or not printable, use fallback
     if not decoded_text or not decoded_text.isprintable():
         print("⚠️ Binary decoding failed or non-printable. Using fallback text.")
         decoded_text = fallback_text
-
     # 3. Extract colored regions (contours)
     bits = safe_extract_colored_contours_with_positions(color_img)
     for b in bits:
         b['bit'] = '1'  # not used for text, just for compatibility
-
     # Adjust coordinates
     for b in bits:
         b['x'] = int(b['x'] * scale_x)
         b['y'] = int(b['y'] * scale_y)
         b['w'] = int(b['w'] * scale_x)
         b['h'] = int(b['h'] * scale_y)
-
     cv2.imwrite("output/debug_thresh_check.png", thresh_img)
     if not bits:
         print("❌ No bits detected.")
         return None, None
-
     # 4. Use decoded_text to fill the regions
     shape_output = recreate_shape_from_bits_grid(bits, decoded_text)
     lines = group_bits_by_lines(bits)
     original_image_size = (color_img.shape[1], color_img.shape[0])
-    render_text_image(lines, bits, decoded_text, original_image_size, output_file="output/translated_preview.png")
-    render_text_in_blocks(bits, decoded_text, original_image_size, output_file="output/translated_blocks.png")
     macroblocks = group_blocks_to_macroblocks(bits)
-    render_text_in_macroblocks(macroblocks, decoded_text, original_image_size, output_file="output/translated_macroblocks.png")
+    print(f"Macroblocks before merging: {len(macroblocks)}")
+    merged_macroblocks = merge_macroblocks(macroblocks, proximity_thresh=120, color_thresh=20)
+    print(f"Macroblocks after merging: {len(merged_macroblocks)}")
+    # Debug preview with macroblock outlines
+    render_macroblock_grid_preview(merged_macroblocks, decoded_text, original_image_size, output_file="output/debug_colorBlocks.png")
+    # Final output: use merged macroblocks in grid style
+    import os
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    final_output_path = f"output/final_output_{base_name}.jpeg"
+    render_text_in_macroblocks_gridstyle(merged_macroblocks, decoded_text, original_image_size, output_file=final_output_path)
+    render_text_in_blocks(bits, decoded_text, original_image_size, output_file="output/translated_blocks.png")
+    render_text_in_macroblocks(merged_macroblocks, decoded_text, original_image_size, output_file="output/translated_macroblocks.png")
     export_svg(bits, decoded_text, color_img)
-
     print("\n🔠 Decoded Text:\n", decoded_text)
     print("\n🎩 Reconstructed Shape:\n", shape_output)
     return decoded_text, shape_output
 
 if __name__ == '__main__':
-    image_path = 'test/testColor.jpeg'
+    image_path = "test/FlagColor.jpeg"
     process_image_to_shape(image_path)
