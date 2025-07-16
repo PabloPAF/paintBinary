@@ -347,8 +347,9 @@ def binary_to_text(binary_str):
 
     decoded = ''.join(chars)
     print("🔠 Decoded Text (first 100 chars):")
-    print(decoded[:100])
-
+    print(decoded[:300])
+    return decoded
+    # From here temporarely stopped
     # Extract the longest sequence of printable characters with reasonable length
     print("🔍 Extracting printable region...")
     matches = re.findall(r'[a-zA-Z0-9 .,%:;!?\'\"@#\(\)\[\]\{\}\-\n]{5,}', decoded)
@@ -1214,5 +1215,5 @@ def process_image_to_shape(image_path, fallback_text="VivaPalestina"):
     return decoded_text, shape_output
 
 if __name__ == '__main__':
-    image_path = "test/FlagColor.jpeg"
+    image_path = "test/poem_test_bw/poem_test_bw.1.jpeg"
     process_image_to_shape(image_path)
